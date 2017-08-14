@@ -1,12 +1,12 @@
 // 1. add log file
-// 2. add log rotation
 // 2. log level
+// 2. add log rotation
 // 3. add line number
-// 4. cmd time out
-// 5. send message
+// 5. send message: tcp
 // 6. error handling
-// 7. panic system
-// 8. test code
+// 7. panic handle
+// 8. how to test code
+// 9. support file filter: exclude
 
 package main
 
@@ -40,8 +40,21 @@ const (
 	Ready int = 2
 )
 
+const (
+	DataInUse  string = "0"
+	ToCool     string = "1"
+	CoolDone   string = "2"
+	ToUpload   string = "3"
+	UploadDone string = "4"
+	ToSync     string = "5"
+	SyncDone   string = "6"
+	UploadErr  string = "7"
+	SyncErr    string = "8"
+)
+
 const ConfPath string = "/etc/demo/demo.conf"
 
+var msgInfo = make(map[string]string)
 var config Config
 
 func init() {
@@ -60,6 +73,17 @@ func init() {
 	}
 
 	log.Println("configration:", config)
+
+	// generate msgInfo
+	msgInfo[DataInUse] = "data in use"
+	msgInfo[ToCool] = "to cool"
+	msgInfo[CoolDone] = "cool done"
+	msgInfo[ToUpload] = "to upload"
+	msgInfo[UploadDone] = "upload done"
+	msgInfo[ToSync] = "to sync"
+	msgInfo[SyncDone] = "sync done"
+	msgInfo[UploadErr] = "upload error"
+	msgInfo[SyncErr] = "sync error"
 }
 
 func monitor(done <-chan bool, chReq chan<- Request) {
@@ -76,11 +100,17 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 	}
 
 	pending := make(map[string]int)
+	var count int
 
 	go func() {
 		for {
 			select {
 			case event := <-watcher.Events:
+				udpSender(DataInUse)
+
+				// reset time counter
+				count = 0
+
 				if event.Op&fsnotify.Create == fsnotify.Create {
 					log.Println("event:", event)
 					pending[event.Name] = New
@@ -96,24 +126,37 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 					pending[event.Name] = Ready
 					//log.Println("pending:", pending)
 				}
+
 			case err := <-watcher.Errors:
+				count = 0
 				if err != nil {
 					log.Println("error:", err)
 				}
-			case <-time.After(time.Duration(config.Cool) * time.Second):
-				//log.Println("cold down, pending:", pending)
 
-				req := Request{Level: 0}
-				for k, v := range pending {
-					if v != No {
-						req.Files = append(req.Files, k)
-					}
-					delete(pending, k)
+			case <-time.After(time.Second):
+				count += 1
+				log.Println("cool count:", count)
+
+				if count == 1 {
+					udpSender(ToCool)
 				}
 
-				if len(req.Files) > 0 {
-					log.Println("send request:", req)
-					chReq <- req
+				if count == config.Cool {
+					log.Println("cold status with pending:", pending)
+					udpSender(CoolDone)
+
+					req := Request{Level: 0}
+					for k, v := range pending {
+						if v != No {
+							req.Files = append(req.Files, k)
+						}
+						delete(pending, k)
+					}
+
+					if len(req.Files) > 0 {
+						log.Println("send request:", req)
+						chReq <- req
+					}
 				}
 
 			case <-done:
@@ -174,7 +217,7 @@ func loadConf() (Config, error) {
 }
 
 func udpSender(msg string) error {
-	log.Println("send msg via udp:", msg)
+	log.Println("send msg via udp:", msg, msgInfo[msg])
 
 	conn, err := net.Dial("udp", config.Udp)
 	if err != nil {
@@ -246,7 +289,7 @@ func cmdExecutor(name string, arg ...string) error {
 	return nil
 }
 
-func upload(file, cont string) {
+func upload(file, cont string) error {
 	log.Printf("upload file %s to container %s", file, cont)
 
 	name := "dacli"
@@ -264,11 +307,13 @@ func upload(file, cont string) {
 
 	err := cmdExecutor(name, args...)
 	if err != nil {
-		return
+		return err
 	}
+
+	return nil
 }
 
-func sync(cont string) {
+func sync(cont string) error {
 	log.Printf("sync container: %s", cont)
 
 	name := "dacli"
@@ -284,12 +329,13 @@ func sync(cont string) {
 
 	err := cmdExecutor(name, args...)
 	if err != nil {
-		return
+		return err
 	}
+
+	return nil
 }
 
 func handler(done <-chan bool, chReq <-chan Request) {
-	// TODO: send msg
 	log.Println("start handler to handle request")
 
 	var cont string
@@ -298,17 +344,29 @@ func handler(done <-chan bool, chReq <-chan Request) {
 		select {
 		case req := <-chReq:
 			log.Println("receive req:", req)
-			// select contaienr
+			// 1. select contaienr
 			cont = selectCont(cont)
 			log.Println("select container:", cont)
 
-			// upload files as a batch
+			// 2. upload files as a batch
 			for _, file := range req.Files {
-				upload(file, cont)
+				udpSender(ToUpload)
+				err := upload(file, cont)
+				if err != nil {
+					udpSender(UploadErr)
+				} else {
+					udpSender(UploadDone)
+				}
 			}
 
-			// sync
-			sync(cont)
+			// 3. sync
+			udpSender(ToSync)
+			err := sync(cont)
+			if err != nil {
+				udpSender(SyncErr)
+			} else {
+				udpSender(SyncDone)
+			}
 
 		case <-done:
 			log.Println("done")
@@ -318,17 +376,14 @@ func handler(done <-chan bool, chReq <-chan Request) {
 }
 
 func main() {
-	/*
-		done := make(chan bool)
-		chReq := make(chan Request)
+	done := make(chan bool)
+	chReq := make(chan Request)
 
-		// start monitor: generate request, send to handler;
-		go monitor(done, chReq)
+	// start monitor: generate request, send to handler;
+	go monitor(done, chReq)
 
-		// start handler: handle request
-		go handler(done, chReq)
+	// start handler: handle request
+	go handler(done, chReq)
 
-		<-done
-	*/
-	udpSender("hello")
+	<-done
 }
