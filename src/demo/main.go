@@ -32,30 +32,38 @@ type Config struct {
 	User   string   `json:"user"`
 	Pass   string   `json:"pass"`
 	Samba  string   `json:"samba"`
+	Gap    int      `json:"gap"`
 }
 
+// file status
 const (
 	No    int = 0
 	New   int = 1
 	Ready int = 2
 )
 
+// start and end
 const (
-	DataInUse  string = "0"
-	ToCool     string = "1"
-	CoolDone   string = "2"
-	ToUpload   string = "3"
-	UploadDone string = "4"
-	ToSync     string = "5"
-	SyncDone   string = "6"
-	UploadErr  string = "7"
-	SyncErr    string = "8"
+	WaitStart   string = "1"
+	StreamStart string = "2"
+	StreamDone  string = "12"
+	CoolStart   string = "3"
+	CoolDone    string = "13"
+	UploadStart string = "4"
+	UploadDone  string = "14"
+	SyncStart   string = "5"
+	SyncDone    string = "15"
+	UploadErr   string = "20"
+	SyncErr     string = "21"
 )
 
 const ConfPath string = "/etc/demo/demo.conf"
 
 var msgInfo = make(map[string]string)
 var config Config
+
+var enable bool = false
+var isDataVary = false
 
 func init() {
 	// load configration
@@ -75,12 +83,14 @@ func init() {
 	log.Println("configration:", config)
 
 	// generate msgInfo
-	msgInfo[DataInUse] = "data in use"
-	msgInfo[ToCool] = "to cool"
+	msgInfo[WaitStart] = "start to wait"
+	msgInfo[StreamStart] = "data varying"
+	msgInfo[StreamDone] = "data invariant"
+	msgInfo[CoolStart] = "cool start"
 	msgInfo[CoolDone] = "cool done"
-	msgInfo[ToUpload] = "to upload"
+	msgInfo[UploadStart] = "upload start"
 	msgInfo[UploadDone] = "upload done"
-	msgInfo[ToSync] = "to sync"
+	msgInfo[SyncStart] = "sync start"
 	msgInfo[SyncDone] = "sync done"
 	msgInfo[UploadErr] = "upload error"
 	msgInfo[SyncErr] = "sync error"
@@ -100,50 +110,66 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 	}
 
 	pending := make(map[string]int)
-	var count int
+	var waitTime int
 
 	go func() {
 		for {
 			select {
 			case event := <-watcher.Events:
-				udpSender(DataInUse)
-
-				// reset time counter
-				count = 0
+				waitTime = 0
+				// send the signal once
+				if waitTime == 0 && !isDataVary {
+					udpSender(StreamStart)
+					isDataVary = true
+				}
 
 				if event.Op&fsnotify.Create == fsnotify.Create {
+					enable = true
 					log.Println("event:", event)
 					pending[event.Name] = New
 					//log.Println("pending:", pending)
 				}
+
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
 					log.Println("event:", event)
 					pending[event.Name] = No
 					//log.Println("pending:", pending)
 				}
+
 				if event.Op&fsnotify.Chmod == fsnotify.Chmod {
+					enable = true
 					log.Println("event:", event)
 					pending[event.Name] = Ready
 					//log.Println("pending:", pending)
 				}
 
 			case err := <-watcher.Errors:
-				count = 0
+				// send error signal: 20
+				waitTime = 0
 				if err != nil {
 					log.Println("error:", err)
 				}
 
 			case <-time.After(time.Second):
-				count += 1
-				log.Println("cool count:", count)
+				waitTime += 1
+				isDataVary = false
+				log.Println("cool waitTime:", waitTime)
 
-				if count == 1 {
-					udpSender(ToCool)
+				// add 'enable' to prevent invalid signal,
+				// when starting program
+				if waitTime == 1 && enable {
+					udpSender(StreamDone)
 				}
 
-				if count == config.Cool {
-					log.Println("cold status with pending:", pending)
+				if waitTime == 1+config.Gap && enable {
+					udpSender(CoolStart)
+				}
+
+				// check length of pending to prevent invalid signal
+				if waitTime == 1+config.Gap+config.Cool && len(pending) > 0 {
 					udpSender(CoolDone)
+
+					log.Println("cold status with pending:", pending)
 
 					req := Request{Level: 0}
 					for k, v := range pending {
@@ -157,6 +183,13 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 						log.Println("send request:", req)
 						chReq <- req
 					}
+				}
+
+				// prevent waitTime to be too large
+				if waitTime >= 2000 {
+					// the reset value should be larger than
+					// condition in which wait signal sended
+					waitTime = config.Cool + 2
 				}
 
 			case <-done:
@@ -180,6 +213,7 @@ func genConf() error {
 		User:   "system",
 		Pass:   "123456",
 		Samba:  "/tmp/foo",
+		Gap:    3,
 	}
 
 	b, err := json.MarshalIndent(conf, "", "    ")
@@ -226,11 +260,19 @@ func udpSender(msg string) error {
 	}
 	defer conn.Close()
 
-	err = gob.NewEncoder(conn).Encode(msg)
+	_, err = conn.Write([]byte(msg))
 	if err != nil {
 		log.Println("send error:", err)
-		return err
 	}
+	/*
+		// the length of data sended to windows is 4.
+		// but the length should be 1;
+		err = gob.NewEncoder(conn).Encode(msg)
+		if err != nil {
+			log.Println("send error:", err)
+			return err
+		}
+	*/
 
 	return nil
 }
@@ -350,7 +392,7 @@ func handler(done <-chan bool, chReq <-chan Request) {
 
 			// 2. upload files as a batch
 			for _, file := range req.Files {
-				udpSender(ToUpload)
+				udpSender(UploadStart)
 				err := upload(file, cont)
 				if err != nil {
 					udpSender(UploadErr)
@@ -360,12 +402,17 @@ func handler(done <-chan bool, chReq <-chan Request) {
 			}
 
 			// 3. sync
-			udpSender(ToSync)
+			time.Sleep(time.Duration(config.Gap) * time.Second)
+			udpSender(SyncStart)
 			err := sync(cont)
 			if err != nil {
 				udpSender(SyncErr)
 			} else {
 				udpSender(SyncDone)
+			}
+
+			if !isDataVary {
+				udpSender(WaitStart)
 			}
 
 		case <-done:
