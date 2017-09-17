@@ -47,14 +47,15 @@ const (
 	WaitStart   string = "1"
 	StreamStart string = "2"
 	StreamDone  string = "12"
-	CoolStart   string = "3"
-	CoolDone    string = "13"
-	UploadStart string = "4"
-	UploadDone  string = "14"
-	SyncStart   string = "5"
-	SyncDone    string = "15"
-	UploadErr   string = "20"
-	SyncErr     string = "21"
+	UploadStart string = "3"
+	UploadDone  string = "13"
+	SyncStart   string = "4"
+	SyncDone    string = "14"
+	TailStart   string = "5"
+	TailEnd     string = "15"
+	SymErr      string = "20"
+	UploadErr   string = "21"
+	SyncErr     string = "22"
 )
 
 const ConfPath string = "/etc/demo/demo.conf"
@@ -86,12 +87,13 @@ func init() {
 	msgInfo[WaitStart] = "start to wait"
 	msgInfo[StreamStart] = "data varying"
 	msgInfo[StreamDone] = "data invariant"
-	msgInfo[CoolStart] = "cool start"
-	msgInfo[CoolDone] = "cool done"
 	msgInfo[UploadStart] = "upload start"
 	msgInfo[UploadDone] = "upload done"
 	msgInfo[SyncStart] = "sync start"
 	msgInfo[SyncDone] = "sync done"
+	msgInfo[TailStart] = "start tail work of show"
+	msgInfo[TailEnd] = "end tail work of show"
+	msgInfo[SymErr] = "system error"
 	msgInfo[UploadErr] = "upload error"
 	msgInfo[SyncErr] = "sync error"
 }
@@ -117,9 +119,12 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 			select {
 			case event := <-watcher.Events:
 				waitTime = 0
+
 				// send the signal once
-				if waitTime == 0 && !isDataVary {
-					udpSender(StreamStart)
+				if !isDataVary {
+					if event.Op&fsnotify.Remove != fsnotify.Remove {
+						udpSender(StreamStart)
+					}
 					isDataVary = true
 				}
 
@@ -144,32 +149,29 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 				}
 
 			case err := <-watcher.Errors:
-				// send error signal: 20
 				waitTime = 0
 				if err != nil {
+					udpSender(SymErr)
 					log.Println("error:", err)
 				}
 
 			case <-time.After(time.Second):
 				waitTime += 1
 				isDataVary = false
-				log.Println("cool waitTime:", waitTime)
+				//log.Println("cool waitTime:", waitTime)
 
 				// add 'enable' to prevent invalid signal,
 				// when starting program
-				if waitTime == 1 && enable {
-					udpSender(StreamDone)
-				}
-
-				if waitTime == 1+config.Gap && enable {
-					udpSender(CoolStart)
-				}
+				/*
+					if waitTime == 1 && enable {
+						udpSender(StreamDone)
+					}
+				*/
 
 				// check length of pending to prevent invalid signal
-				if waitTime == 1+config.Gap+config.Cool && len(pending) > 0 {
-					udpSender(CoolDone)
-
-					log.Println("cold status with pending:", pending)
+				if waitTime == 1+config.Gap && len(pending) > 0 {
+					udpSender(StreamDone)
+					log.Println("cold files:", pending)
 
 					req := Request{Level: 0}
 					for k, v := range pending {
@@ -189,7 +191,7 @@ func monitor(done <-chan bool, chReq chan<- Request) {
 				if waitTime >= 2000 {
 					// the reset value should be larger than
 					// condition in which wait signal sended
-					waitTime = config.Cool + 2
+					waitTime = 2 + config.Gap
 				}
 
 			case <-done:
@@ -386,23 +388,24 @@ func handler(done <-chan bool, chReq <-chan Request) {
 		select {
 		case req := <-chReq:
 			log.Println("receive req:", req)
+
 			// 1. select contaienr
 			cont = selectCont(cont)
 			log.Println("select container:", cont)
 
 			// 2. upload files as a batch
+			udpSender(UploadStart)
+			time.Sleep(time.Duration(config.Cool) * time.Second)
 			for _, file := range req.Files {
-				udpSender(UploadStart)
 				err := upload(file, cont)
 				if err != nil {
-					udpSender(UploadErr)
-				} else {
-					udpSender(UploadDone)
+					log.Println("fail to upload file:", file, ", to:", cont)
 				}
 			}
+			time.Sleep(time.Duration(config.Gap) * time.Second)
+			udpSender(UploadDone)
 
 			// 3. sync
-			time.Sleep(time.Duration(config.Gap) * time.Second)
 			udpSender(SyncStart)
 			err := sync(cont)
 			if err != nil {
@@ -411,7 +414,11 @@ func handler(done <-chan bool, chReq <-chan Request) {
 				udpSender(SyncDone)
 			}
 
+			// 4. tail of show
+			udpSender(TailStart)
+			time.Sleep(time.Duration(config.Gap) * time.Second)
 			if !isDataVary {
+				udpSender(TailEnd)
 				udpSender(WaitStart)
 			}
 
